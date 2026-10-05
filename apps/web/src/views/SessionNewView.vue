@@ -5,6 +5,13 @@ import { apiFetch, ApiError } from "../api/client.js";
 import { useAuthStore } from "../stores/auth.js";
 import { toDateTimeLocal } from "../utils/format.js";
 
+// 一次“新建练习”意图对应一个稳定幂等键：网络重试/服务端降级时重复提交
+// 只会拿到首次创建的练习，不会建出第二条。成功跳转后换新键供下次创建。
+function createIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 const router = useRouter();
 const auth = useAuthStore();
 const title = ref("");
@@ -16,6 +23,7 @@ const notes = ref("");
 const durationMinutes = ref<number | null>(null);
 const error = ref("");
 const submitting = ref(false);
+const idempotencyKey = ref(createIdempotencyKey());
 
 onMounted(() => { instrument.value = auth.user?.defaultInstrument ?? ""; });
 
@@ -25,6 +33,7 @@ async function submit(): Promise<void> {
   try {
     const result = await apiFetch<{ session: { id: string } }>("/api/v1/sessions", {
       method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey.value },
       body: JSON.stringify({
         title: title.value,
         instrument: instrument.value,
@@ -35,9 +44,15 @@ async function submit(): Promise<void> {
         ...(durationMinutes.value == null ? {} : { actualDurationMs: durationMinutes.value * 60_000 }),
       }),
     });
+    idempotencyKey.value = createIdempotencyKey();
     await router.push(`/sessions/${result.session.id}/review`);
   } catch (reason) {
     error.value = reason instanceof ApiError ? reason.message : "创建练习失败";
+    // 请求从未被接受（校验/键复用）时换新键，避免修正后重试被判为键复用；
+    // 可重试的服务端/网络错误保留原键，由服务端幂等去重。
+    if (reason instanceof ApiError && (reason.status === 400 || reason.status === 422)) {
+      idempotencyKey.value = createIdempotencyKey();
+    }
   } finally {
     submitting.value = false;
   }

@@ -52,7 +52,7 @@ export async function buildApp() {
     origin: config.WEB_ORIGIN,
     credentials: true,
     methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["content-type", "authorization", "x-request-id", "x-idempotency-key"],
+    allowedHeaders: ["content-type", "authorization", "x-request-id", "idempotency-key", "x-idempotency-key"],
     exposedHeaders: ["x-request-id"],
   });
   await app.register(helmet, { contentSecurityPolicy: false });

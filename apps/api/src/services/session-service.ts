@@ -5,10 +5,15 @@ import {
   type SessionStatus as ContractSessionStatus,
 } from "@practice/contracts";
 import type { z } from "zod";
-import type { completionSchema, sessionListQuerySchema } from "@practice/contracts";
+import type { completionSchema, sessionCreateSchema, sessionListQuerySchema } from "@practice/contracts";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { enqueueCleanup } from "../lib/queue.js";
+import {
+  IDEMPOTENCY_INFLIGHT_GRACE_MS,
+  IDEMPOTENCY_RESOURCE_SESSION_CREATE,
+  IDEMPOTENCY_TTL_MS,
+} from "../lib/idempotency.js";
 
 export const sessionInclude = {
   mediaAssets: {
@@ -354,4 +359,153 @@ export async function completeSession(
 
 export function allowedSessionTransition(from: ContractSessionStatus, to: ContractSessionStatus): boolean {
   return from === to || (from === "DRAFT" && to === "IN_REVIEW") || (from === "IN_REVIEW" && to === "COMPLETED");
+}
+
+export type SessionCreateInput = z.infer<typeof sessionCreateSchema>;
+
+function sessionCreateData(userId: string, input: SessionCreateInput) {
+  return {
+    userId,
+    title: input.title,
+    instrument: input.instrument,
+    focus: input.focus ?? null,
+    location: input.location ?? null,
+    notes: input.notes ?? null,
+    startedAt: input.startedAt,
+    actualDurationMs: input.actualDurationMs ?? 0,
+  };
+}
+
+export type BeginSessionCreateResult =
+  | { outcome: "proceed"; idempotencyId: string }
+  | {
+      outcome: "completed";
+      idempotency: Prisma.IdempotencyKeyGetPayload<object>;
+      responseBody: { session: unknown; warnings?: string[] };
+    };
+
+function interpretExisting(
+  existing: Prisma.IdempotencyKeyGetPayload<object>,
+  requestHash: string,
+): BeginSessionCreateResult {
+  if (existing.requestHash !== requestHash) {
+    throw new AppError(422, "IDEMPOTENCY_KEY_REUSED", "同一幂等键不能用于不同的创建请求，请重新提交");
+  }
+  if (existing.status === "COMPLETED") {
+    return {
+      outcome: "completed",
+      idempotency: existing,
+      responseBody: (existing.responseBody as { session: unknown; warnings?: string[] }) ?? { session: null },
+    };
+  }
+  if (existing.createdAt.getTime() > Date.now() - IDEMPOTENCY_INFLIGHT_GRACE_MS) {
+    throw new AppError(409, "IDEMPOTENCY_IN_PROGRESS", "创建请求正在处理中，请稍后重试");
+  }
+  return { outcome: "proceed", idempotencyId: existing.id };
+}
+
+/**
+ * Idempotency gate for session creation.
+ *
+ * - Unknown key: inserts a CREATING marker and lets the caller proceed.
+ * - Completed key with the same request hash: replays the stored result.
+ * - Key reused with a different request hash: 422, the key cannot be retried
+ *   with a different payload.
+ * - CREATING key that is still fresh: 409, a concurrent request owns the key.
+ * - CREATING key older than the grace window: the original request crashed
+ *   before commit; the retry adopts the key and proceeds.
+ */
+export async function beginSessionCreate(
+  userId: string,
+  key: string,
+  requestHash: string,
+): Promise<BeginSessionCreateResult> {
+  const existing = await prisma.idempotencyKey.findUnique({
+    where: { userId_key: { userId, key } },
+  });
+  if (existing) return interpretExisting(existing, requestHash);
+
+  try {
+    const marker = await prisma.idempotencyKey.create({
+      data: {
+        userId,
+        key,
+        resourceType: IDEMPOTENCY_RESOURCE_SESSION_CREATE,
+        requestHash,
+        status: "CREATING",
+        expiresAt: new Date(Date.now() + IDEMPOTENCY_TTL_MS),
+      },
+    });
+    return { outcome: "proceed", idempotencyId: marker.id };
+  } catch (error) {
+    // Concurrent request inserted the same (userId, key) first: interpret it.
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      const winner = await prisma.idempotencyKey.findUnique({
+        where: { userId_key: { userId, key } },
+      });
+      if (winner) return interpretExisting(winner, requestHash);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Atomically creates the practice session and finalizes the idempotency
+ * record in a degraded-but-truthful baseline ("audit pending"). Because both
+ * writes share one transaction, a crash can never leave a committed session
+ * behind a CREATING marker (or vice versa). The audit row is written after
+ * commit by the caller, which upgrades the stored snapshot on success; if
+ * that write fails (or the process dies first) a retry replays this record
+ * and recovers the missing audit row.
+ */
+export async function commitSessionCreate(
+  userId: string,
+  idempotencyId: string,
+  input: SessionCreateInput,
+): Promise<{ session: Prisma.PracticeSessionGetPayload<object> }> {
+  return prisma.$transaction(async (tx) => {
+    const session = await tx.practiceSession.create({ data: sessionCreateData(userId, input) });
+    // Conditional claim: a concurrent stale-recovery retry that wins this
+    // update forces us to roll back, so its session is the only one created.
+    const claimed = await tx.idempotencyKey.updateMany({
+      where: { id: idempotencyId, status: "CREATING" },
+      data: {
+        status: "COMPLETED",
+        resourceId: session.id,
+        statusCode: 201,
+        responseBody: { session, warnings: ["AUDIT_PENDING"] } as unknown as Prisma.InputJsonValue,
+        auditStatus: "PENDING",
+      },
+    });
+    if (claimed.count !== 1) {
+      throw new AppError(409, "IDEMPOTENCY_IN_PROGRESS", "创建请求正在处理中，请稍后重试");
+    }
+    return { session };
+  });
+}
+
+/**
+ * Finalizes a completed idempotency record after the post-commit degraded
+ * audit was attempted. The stored response always reflects the real audit
+ * state, so every future replay returns the truthful result.
+ */
+export async function markSessionCreateAuditResult(
+  idempotencyId: string,
+  sessionId: string,
+  session: Prisma.PracticeSessionGetPayload<object>,
+  auditOk: boolean,
+): Promise<{ session: Prisma.PracticeSessionGetPayload<object>; warnings: string[] }> {
+  const warnings = auditOk ? [] : ["AUDIT_PENDING"];
+  await prisma.idempotencyKey.updateMany({
+    where: { id: idempotencyId, resourceId: sessionId },
+    data: {
+      status: "COMPLETED",
+      statusCode: 201,
+      responseBody: auditOk
+        ? ({ session } as unknown as Prisma.InputJsonValue)
+        : ({ session, warnings } as unknown as Prisma.InputJsonValue),
+      auditStatus: auditOk ? "SUCCESS" : "PENDING",
+    },
+  });
+  return { session, warnings };
 }

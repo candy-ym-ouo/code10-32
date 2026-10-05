@@ -73,6 +73,11 @@ enum ExportStatus {
   EXPIRED
 }
 
+enum IdempotencyStatus {
+  CREATING
+  COMPLETED
+}
+
 enum GoalStatus {
   OPEN
   IN_PROGRESS
@@ -100,6 +105,7 @@ model User {
   goalProgresses    GoalProgress[]
   auditLogs         AuditLog[]
   dataExports       DataExport[]
+  idempotencyKeys   IdempotencyKey[]
 
   @@map("users")
 }
@@ -310,4 +316,25 @@ model AuditLog {
   @@index([userId, createdAt(sort: Desc)])
   @@index([action, createdAt(sort: Desc)])
   @@map("audit_logs")
+}
+
+model IdempotencyKey {
+  id           String            @id @default(uuid()) @db.Uuid
+  userId       String            @map("user_id") @db.Uuid
+  key          String            @db.VarChar(128)
+  resourceType String            @map("resource_type") @db.VarChar(60)
+  requestHash  String            @map("request_hash") @db.Char(64)
+  status       IdempotencyStatus @default(CREATING)
+  resourceId   String?           @map("resource_id") @db.Uuid
+  statusCode   Int?
+  responseBody Json?             @map("response_body")
+  auditStatus  String            @default("PENDING") @map("audit_status") @db.VarChar(32)
+  createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime          @updatedAt @map("updated_at") @db.Timestamptz(6)
+  expiresAt    DateTime          @map("expires_at") @db.Timestamptz(6)
+  user         User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
 }

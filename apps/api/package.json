@@ -27,12 +27,13 @@
     "argon2": "^0.45.1",
     "bullmq": "^5.58.0",
     "fastify": "^5.6.2",
+    "fastify-plugin": "^5.1.0",
     "ioredis": "^5.8.2",
     "jsonwebtoken": "^9.0.2",
-    "pino": "^10.1.0",
-    "fastify-plugin": "^5.1.0"
+    "pino": "^10.1.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^24.10.1",
     "prisma": "^6.19.3",
