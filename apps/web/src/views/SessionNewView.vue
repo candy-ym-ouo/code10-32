@@ -16,6 +16,9 @@ const notes = ref("");
 const durationMinutes = ref<number | null>(null);
 const error = ref("");
 const submitting = ref(false);
+// 每个表单实例一个幂等键：提交失败后的重试会复用同一键，
+// 服务端据此返回已创建的练习而不会重复创建。
+const clientRequestId = crypto.randomUUID();
 
 onMounted(() => { instrument.value = auth.user?.defaultInstrument ?? ""; });
 
@@ -25,6 +28,7 @@ async function submit(): Promise<void> {
   try {
     const result = await apiFetch<{ session: { id: string } }>("/api/v1/sessions", {
       method: "POST",
+      headers: { "Idempotency-Key": clientRequestId },
       body: JSON.stringify({
         title: title.value,
         instrument: instrument.value,

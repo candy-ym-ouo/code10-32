@@ -136,6 +136,7 @@ model PracticeSession {
   status           SessionStatus      @default(DRAFT)
   completedAt      DateTime?          @map("completed_at") @db.Timestamptz(6)
   archivedAt       DateTime?          @map("archived_at") @db.Timestamptz(6)
+  clientRequestId  String?            @map("client_request_id") @db.Uuid
   version          Int                @default(0)
   createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt        DateTime           @updatedAt @map("updated_at") @db.Timestamptz(6)
@@ -146,6 +147,7 @@ model PracticeSession {
   goalProgresses   GoalProgress[]
   review           SessionReview?
 
+  @@unique([userId, clientRequestId])
   @@index([userId, status, startedAt(sort: Desc)])
   @@index([userId, instrument])
   @@index([userId, completedAt])

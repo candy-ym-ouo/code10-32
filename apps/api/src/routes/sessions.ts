@@ -1,13 +1,14 @@
 import type { FastifyPluginAsync } from "fastify";
 import { completionSchema, sessionBatchSchema, sessionCreateSchema, sessionListQuerySchema, sessionUpdateSchema } from "@practice/contracts";
 import { z } from "zod";
-import { parseOrThrow } from "../lib/validation.js";
+import { parseClientRequestId, parseOrThrow } from "../lib/validation.js";
 import { AppError } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
-import { audit } from "../lib/audit.js";
+import { audit, getAuditContext } from "../lib/audit.js";
 import {
   archiveSession,
   completeSession,
+  createSession,
   getCompletionMissing,
   getSessionForUser,
   listSessions,
@@ -31,20 +32,14 @@ const sessionRoutes: FastifyPluginAsync = async (app) => {
     if (input.startedAt.getTime() > Date.now() + 5 * 60_000) {
       throw new AppError(400, "VALIDATION_ERROR", "练习开始时间不能晚于当前时间 5 分钟以上");
     }
-    const created = await prisma.practiceSession.create({
-      data: {
-        userId: request.authUser!.id,
-        title: input.title,
-        instrument: input.instrument,
-        focus: input.focus ?? null,
-        location: input.location ?? null,
-        notes: input.notes ?? null,
-        startedAt: input.startedAt,
-        actualDurationMs: input.actualDurationMs ?? 0,
-      },
-    });
-    await audit(request, "SESSION_CREATED", "PRACTICE_SESSION", created.id, "SUCCESS");
-    return reply.status(201).send({ session: created });
+    const clientRequestId = parseClientRequestId(request.headers["idempotency-key"]);
+    const { session, created } = await createSession(
+      request.authUser!.id,
+      input,
+      clientRequestId,
+      getAuditContext(request),
+    );
+    return reply.status(created ? 201 : 200).send({ session });
   });
 
   app.post("/batch/archive", async (request) => {

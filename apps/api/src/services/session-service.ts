@@ -1,14 +1,16 @@
 import { Prisma, SessionStatus } from "@prisma/client";
+import type { PracticeSession } from "@prisma/client";
 import {
   calculateSessionDuration,
   describeMissingReview,
   type SessionStatus as ContractSessionStatus,
 } from "@practice/contracts";
 import type { z } from "zod";
-import type { completionSchema, sessionListQuerySchema } from "@practice/contracts";
+import type { completionSchema, sessionCreateSchema, sessionListQuerySchema } from "@practice/contracts";
 import { AppError, notFound } from "../lib/errors.js";
 import { prisma } from "../lib/prisma.js";
 import { enqueueCleanup } from "../lib/queue.js";
+import { writeAuditLog, type AuditContext } from "../lib/audit.js";
 
 export const sessionInclude = {
   mediaAssets: {
@@ -51,6 +53,60 @@ export async function getSessionForUser(userId: string, sessionId: string) {
   });
   if (!session) throw notFound();
   return session;
+}
+
+/**
+ * 创建练习并同事务写入审计日志：任一步失败都会整体回滚，
+ * 因此返回错误时一定没有留下已提交的练习。
+ *
+ * 携带 clientRequestId 的请求是幂等的：同一用户重复提交同一 key
+ * （例如客户端在响应丢失后重试）会返回首次创建的练习，而不是重复创建。
+ */
+export async function createSession(
+  userId: string,
+  input: z.infer<typeof sessionCreateSchema>,
+  clientRequestId: string | null,
+  auditContext: AuditContext,
+): Promise<{ session: PracticeSession; created: boolean }> {
+  if (clientRequestId) {
+    const existing = await prisma.practiceSession.findFirst({
+      where: { userId, clientRequestId },
+    });
+    if (existing) return { session: existing, created: false };
+  }
+  try {
+    const session = await prisma.$transaction(async (tx) => {
+      const created = await tx.practiceSession.create({
+        data: {
+          userId,
+          title: input.title,
+          instrument: input.instrument,
+          focus: input.focus ?? null,
+          location: input.location ?? null,
+          notes: input.notes ?? null,
+          startedAt: input.startedAt,
+          actualDurationMs: input.actualDurationMs ?? 0,
+          clientRequestId,
+        },
+      });
+      await writeAuditLog(tx, auditContext, "SESSION_CREATED", "PRACTICE_SESSION", created.id, "SUCCESS");
+      return created;
+    });
+    return { session, created: true };
+  } catch (error) {
+    // 并发重试撞上唯一约束时，另一个请求已提交，返回它创建的练习
+    if (
+      clientRequestId &&
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === "P2002"
+    ) {
+      const existing = await prisma.practiceSession.findFirst({
+        where: { userId, clientRequestId },
+      });
+      if (existing) return { session: existing, created: false };
+    }
+    throw error;
+  }
 }
 
 export async function listSessions(userId: string, query: z.infer<typeof sessionListQuerySchema>) {

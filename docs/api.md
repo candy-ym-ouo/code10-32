@@ -39,7 +39,7 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/sessions` | 光标分页、搜索、筛选和排序 |
-| POST | `/sessions` | 创建练习 |
+| POST | `/sessions` | 创建练习，支持 `Idempotency-Key` 幂等 |
 | GET | `/sessions/:id` | 详情，包含音频、标记、目标和复盘 |
 | PATCH | `/sessions/:id` | 乐观锁更新；请求必须带 `version` |
 | POST | `/sessions/:id/start-review` | 存在已就绪音频时进入 `IN_REVIEW` |
@@ -62,6 +62,10 @@ Refresh Cookie 路径为 `/api/v1/auth`，生产环境在 HTTPS 下自动使用 
   "actualDurationMs": 1800000
 }
 ```
+
+练习与审计日志在同一数据库事务中提交：接口返回错误时一定没有创建任何数据，客户端可以安全重试。
+
+客户端应携带 `Idempotency-Key: <uuid>` 请求头标识一次创建操作。首次创建返回 `201`；使用相同键重试（例如响应丢失后）返回 `200` 和首次创建的练习，不会重复创建。键非法时返回 `400 VALIDATION_ERROR`。
 
 ## 音频上传
 
